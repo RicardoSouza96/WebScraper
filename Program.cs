@@ -1,6 +1,7 @@
 ﻿using Microsoft.Playwright;
 using ClosedXML.Excel;
 using System.Globalization;
+using System.Text.RegularExpressions;
 
 public class DadosClimaticos
 {
@@ -15,52 +16,44 @@ class Program
     public static async Task Main()
     {
         Console.Write("Código da estação: ");
-        string stationId = Console.ReadLine();
+        string stationId = Console.ReadLine()?.Trim() ?? "";
         Console.Write("Data de início (ano-mês-dia): ");
-        DateTime.TryParse(Console.ReadLine(), out DateTime dataInicio);
+        bool inicioValido = DateTime.TryParse(Console.ReadLine(), out DateTime dataInicio);
         Console.Write("Data de fim (ano-mês-dia): ");
-        DateTime.TryParse(Console.ReadLine(), out DateTime dataFim);
+        bool fimValido = DateTime.TryParse(Console.ReadLine(), out DateTime dataFim);
+        if (stationId == "" || !inicioValido || !fimValido)
+        {
+            Console.WriteLine("Código da estação ou data inválida.");
+            return;
+        }
         Console.Clear();
         var relatorio = new List<DadosClimaticos>();
 
         using var playwright = await Playwright.CreateAsync();
         await using var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions {Headless = true});
-        var page = await browser.NewPageAsync();
+        var context = await browser.NewContextAsync();
 
         while(dataInicio <= dataFim)
         {
             string dataFormatada = dataInicio.ToString("yyyy-MM-dd");
-            string url = $"https://www.wunderground.com/dashboard/pws/{stationId}/table/{dataFormatada}/{dataFormatada}/daily";
             Console.WriteLine($"\nProcessando dia: {dataFormatada}...");
 
             try
             {
-                await page.GotoAsync(url, new PageGotoOptions { Timeout = 60000 });
+                var linhas = await ColetarDia(context, stationId, dataFormatada);
+                if (linhas.Length == 0)
+                    Console.WriteLine($"Nenhum registro no dia {dataFormatada} (a estação pode ter ficado sem enviar dados).");
 
-                var seletorTabela = "table.history-table.desktop-table";
-                await page.WaitForSelectorAsync(seletorTabela, new PageWaitForSelectorOptions {Timeout = 10000});
-
-                var linhas = await page.Locator($"{seletorTabela} tbody tr").AllAsync();
-                foreach (var linha in linhas)
+                foreach (var celulas in linhas)
                 {
-                    if (await linha.Locator("td").CountAsync() > 0)
+                    // Colunas da tabela: 1 Hora, 2 Temperatura, 3 Ponto de orvalho, 4 Umidade
+                    relatorio.Add(new DadosClimaticos
                     {
-                        var hora = await linha.Locator("td:nth-child(1)").InnerTextAsync();
-                        
-                        var tempLocator = linha.Locator("td:nth-child(2) .wu-value");
-                        var temperatura = await tempLocator.CountAsync() > 0 ? await tempLocator.First.InnerTextAsync() : "N/A";
-
-                        var umidLocator = linha.Locator("td:nth-child(4) .wu-value");
-                        var umidade = await umidLocator.CountAsync() > 0 ? await umidLocator.First.InnerTextAsync() : "N/A";
-
-                        relatorio.Add(new DadosClimaticos
-                        {
-                            Data = dataFormatada,
-                            Hora = hora,
-                            Temperatura = temperatura,
-                            Umidade = umidade
-                        });
-                    }
+                        Data = dataFormatada,
+                        Hora = celulas[0],
+                        Temperatura = celulas[1],
+                        Umidade = celulas[3]
+                    });
                 }
             }
             catch (Exception ex)
@@ -71,16 +64,66 @@ class Program
             dataInicio = dataInicio.AddDays(1);
             await Task.Delay(1000);
 
-            GerarExcel(relatorio);
+            GerarExcel(relatorio, stationId);
         }
         Console.WriteLine("Exportação finalizada. Pressione qualquer tecla para sair...");
         Console.ReadKey();
     }
 
-    static void GerarExcel(List<DadosClimaticos> dados)
+    static async Task<string[][]> ColetarDia(IBrowserContext context, string stationId, string data)
+    {
+        var page = await context.NewPageAsync();
+        try
+        {
+            // O site ignora a data da URL: o período exibido vem do localStorage, o mesmo que o seletor "Custom" da página grava
+            await page.AddInitScriptAsync($$"""
+                try {
+                    localStorage.setItem('wu-date-range', 'custom');
+                    localStorage.setItem('wu-date-custom-start', '{{data}}');
+                    localStorage.setItem('wu-date-custom-end', '{{data}}');
+                } catch {}
+                """);
+
+            await page.GotoAsync($"https://www.wunderground.com/dashboard/pws/{stationId}", new PageGotoOptions { Timeout = 60000 });
+
+            // Espera os componentes carregarem e o seletor de datas aplicar o período (ele preenche o rótulo da data ao terminar).
+            // Antes disso o site passa por uma verificação anti-bot que recarrega a página, por isso o timeout longo
+            var periodo = await page.WaitForFunctionAsync(@"() => {
+                const datas = document.querySelector('pws-history-dates');
+                const pronto = customElements.get('dashboard-body-view') && customElements.get('pws-history-table') && datas?.querySelector('.date-label')?.textContent;
+                return pronto ? datas.startDate : false;
+            }", null, new PageWaitForFunctionOptions { Timeout = 60000 });
+            string dataExibida = await periodo.JsonValueAsync<string>();
+            if (dataExibida != data)
+                throw new Exception($"o site exibiu o dia {dataExibida} em vez de {data}");
+
+            // A tabela só é preenchida depois de trocar a visão "Graph" por "Table"
+            await page.Locator("button.toggle-btn[data-view='table']").DispatchEventAsync("click");
+
+            var seletorLinhas = "pws-history-table table tbody tr";
+            try
+            {
+                await page.Locator(seletorLinhas).First.WaitForAsync(new LocatorWaitForOptions { Timeout = 20000 });
+            }
+            catch (TimeoutException)
+            {
+                // A tabela fica vazia quando a estação não enviou dados no dia
+                return Array.Empty<string[]>();
+            }
+
+            return await page.Locator(seletorLinhas).EvaluateAllAsync<string[][]>(
+                "linhas => linhas.map(linha => Array.from(linha.cells, celula => celula.innerText.trim()))");
+        }
+        finally
+        {
+            await page.CloseAsync();
+        }
+    }
+
+    static void GerarExcel(List<DadosClimaticos> dados, string stationId)
     {
         string nomePasta = "Relatorio";
-        string nomeArquivo = "DadosClimaticos.xlsx";
+        string nomeArquivo = $"DadosClimaticos_{stationId}.xlsx";
 
         if(!Directory.Exists(nomePasta))
             Directory.CreateDirectory(nomePasta);
@@ -109,19 +152,22 @@ class Program
                 worksheet.Cell(linhaAtual, 1).Value = item.Data;
                 worksheet.Cell(linhaAtual, 2).Value = item.Hora;
                 
-                if (double.TryParse(item.Temperatura, NumberStyles.Any, CultureInfo.InvariantCulture, out double tempFahrenheit))
+                var temperatura = ExtrairNumero(item.Temperatura);
+                if (temperatura.HasValue)
                 {
-                    double tempCelsiusExata = (tempFahrenheit - 32) / 1.8;
-                    double tempCelsiusFinal = Math.Round(tempCelsiusExata, 1, MidpointRounding.AwayFromZero);
-                    worksheet.Cell(linhaAtual, 3).Value = tempCelsiusFinal;
+                    // O site exibe °C ou °F conforme a preferência de unidade; só converte quando vier em °F
+                    if (item.Temperatura.Contains("°F"))
+                        temperatura = Math.Round((temperatura.Value - 32) / 1.8, 1, MidpointRounding.AwayFromZero);
+                    worksheet.Cell(linhaAtual, 3).Value = temperatura.Value;
                 }
                 else
-                    worksheet.Cell(linhaAtual, 3).Value = item.Temperatura;
+                    worksheet.Cell(linhaAtual, 3).Value = "N/A";
 
-                if (double.TryParse(item.Umidade, NumberStyles.Any, CultureInfo.InvariantCulture, out double umidNum))
-                    worksheet.Cell(linhaAtual, 4).Value = umidNum;
+                var umidade = ExtrairNumero(item.Umidade);
+                if (umidade.HasValue)
+                    worksheet.Cell(linhaAtual, 4).Value = umidade.Value;
                 else
-                    worksheet.Cell(linhaAtual, 4).Value = item.Umidade;
+                    worksheet.Cell(linhaAtual, 4).Value = "N/A";
 
                 linhaAtual++;
             }
@@ -130,5 +176,12 @@ class Program
 
             workbook.SaveAs(caminhoCompleto);
         }
+    }
+
+    // Os valores vêm com a unidade junto e ponto decimal (ex.: "20.4°C", "57%"); célula sem dado vem como "—"
+    static double? ExtrairNumero(string texto)
+    {
+        var numero = Regex.Match(texto, @"-?\d+(\.\d+)?");
+        return numero.Success ? double.Parse(numero.Value, CultureInfo.InvariantCulture) : null;
     }
 }
